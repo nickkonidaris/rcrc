@@ -44,7 +44,6 @@ class TCSReadError(Exception):
     def __str__(self):
         return str(self.value)
 
-
 class SlowCommandFailed(Exception):
     def __init__(self, value):
         self.value = value
@@ -52,6 +51,8 @@ class SlowCommandFailed(Exception):
     
     def __str__(self):
         return str(self.value)
+
+
 
 class Commands:
     '''Wrapper around the GXN/Telnet interface'''
@@ -73,32 +74,41 @@ class Commands:
     def __del__(self):
         self.T.close()
         
+    def write(self, str):
+        T = self.T
+        log.info("Sending '%s'" % str.rstrip())
+        T.write(str)
         
     def read_until(self, s,timeout):
         T = self.T
         try:
-            T.read_until(s, timeout)
+            r=T.read_until(s, timeout)
         except:
             raise TCSReadError(e)
+        log.info("GXN Cmd returned: '%s'" % r.rstrip())
     
     def slow(self, timeout):
-        '''Handle a slow command but waiting for a number to return'''
+        '''Handle a slow command block until timeout'''
+        # A slow command is defined by John Henning as a blocking command.
         T = self.T
         try:
-            r = T.expect(["-?\d"], timeout)
+            r = T.expect(["-?\d"], timeout)[2]
         except Exception as e:
+            log.error("GXN Slow command returned garbage")
             return
-        
+ 
         try: res = int(r)
         except:
-            log.error("Command timed out")
+            log.error("GXN Command timed out")
+            SlowCommandFailed("Time out")
             return
         
+        log.info("GXN Slow command returned %i" % res)
         if res == 0:
-            log.info("Executed command")
+            log.info("GXN Executed command")
         else:
-            log.error("Command failed: %s" % gxn_res[res])
-            raise SlowCommandFailed(res)
+            log.error("GXN Command failed: %s" % self.gxn_res[res])
+            raise SlowCommandFailed("%i: %s" % (res, self.gxn_res[res]))
 
         
     def pt(self, dRA, dDec):
@@ -106,17 +116,63 @@ class Commands:
         Telescope_Motion_Status must be TRACKING or IN_POSITION and changes to
         MOVING during move.'''
         log.info("GXN: pt %f %f" % (dRA, dDec))
-        
-        T = self.T
-        
-        T.write("pt %f %f\n" % (dRA, dDec))
-        T.slow(60)
+                
+        self.write("pt %f %f\n" % (dRA, dDec))
+        self.slow(60)
     
     def takecontrol(self):
-        T = self.T
-        T.write("takecontrol\n")
+        '''Send takecontrol command'''
+        log.info("GXN takecontrol")
+        self.write("takecontrol\n")
         self.read_until("\n", .1)
+        
+        
+    def telinit(self):
+        '''Send telinit command, block for 300 s'''
+        
+        log.info("GXN telinit")
+        self.write("telinit\n")
+        return self.slow(300)
+    
+    def stow_flats(self):
+        '''Stow to flat position, block for 300 s'''
+        
+        log.info("GXN stow flats")
+        self.write("stow 0.0 85.0 90\n")
+        
+        return self.slow(300)
+        
+    def coords(self, ra, # in decimal horus
+                    dec, # in decimal degrees
+                    equinox, # 0 means apparent
+                    ra_rate, dec_rate, 
+                    flag, # adjusts rates. 0: 0.0001sec/yr, 1,2: as/hr
+                    epoch=None): # for non sidereal
 
+        log.info("GXN coords")
+        if epoch is not None:
+            self.write("coords %f %f %f %f %f %i %f\n" %
+                (ra, dec, equinox, ra_rate, dec_rate, flag, epoch))
+        else:
+            self.write("coords %f %f %f %f %f %i\n" %
+                (ra, dec, equinox, ra_rate, dec_rate, flag))
+        
+        self.read_until("\n", .1)
+    
+    
+    def go(self):
+        log.info ('GXN.gopos')
+        self.write('gopos\n')
+        return self.slow(300)
+    
+    def stow_day(self):
+        '''Daystow, block for 300 s'''
+        
+        log.info('GXN daystow')
+        self.write("stow 3.6666666666 50.0 40\n")
+        
+        return self.slow(300)        
+    
 class CommsThread(Thread):
     abort = False
 
@@ -177,7 +233,7 @@ class CommsThread(Thread):
                 if lhs == 'UTSunset': T.UTSunset = rhs
                 if lhs == 'UTSunrise': T.UTsnrs = rhs 
 
-            time.sleep(0.7)
+            time.sleep(2)
 
 class Telescope(HasTraits):
     comms_thread = Instance(CommsThread)
@@ -228,9 +284,53 @@ class Telescope(HasTraits):
         except Exception as e:
             raise TCSConnectionError(e)
 
-        self.comms_thread.telescope = self            
         self.comms_thread = CommsThread()
+        self.comms_thread.telescope = self            
+        
 
+
+
+
+
+class GenericCommsThread(Thread):
+    abort = False
+    resultobj = None
+    
+    def run(self):
+        
+        R = self.resultobj
+        log.info("Starting a communications thread")
+        
+        while not self.abort:
+            try:
+                R.telnet.write("%s\n" % self.command)
+            except Exception as e:
+                raise TCSReadError(e)
+                
+            while True:
+
+                r= R.telnet.read_until("\n", .1)
+                
+                if r == "":
+                    break               
+
+                try:lhs,rhs = r.rstrip().split("=")
+                except: continue
+                
+                try:
+                    type_fun = type(getattr(R, lhs))
+                    setattr(R, lhs, type_fun(rhs))
+                except:
+                    log.info("Could not handle line:\n%s" % r.rstrip())
+                    
+                
+            time.sleep(2)
+
+                
+        
+class WeatherCommsThread(GenericCommsThread):
+    abort = False
+    command = "?WEATHER"
 
 
 
@@ -261,6 +361,7 @@ class Weather(HasTraits):
     Secondary_Cell_Temp = Float()
     Wetness = Int()
     Weather_Status = String()
+    comms_thread = Instance(WeatherCommsThread)
     
     def __init__(self):
         log.info("Weather status thread initalized")
@@ -269,44 +370,20 @@ class Weather(HasTraits):
         except Exception as e:
             raise TCSConnectionError(e)
         self.comms_thread = WeatherCommsThread()
-        self.comms_thread.weather = self
-    
-        
-class WeatherCommsThread(Thread):
+        self.comms_thread.resultobj = self
+
+
+class StatusCommsThread(GenericCommsThread):
     abort = False
-
-        
-    def run(self):       
-        W = self.weather 
-        while not self.abort:
-            try:
-                W.telnet.write("?WEATHER\n")
-            except Exception as e:
-                raise TCSReadError(e)
-                
-            while True:
-
-                r= W.telnet.read_until("\n", .1)
-
-                if r == "":
-                    break               
-
-                try:lhs,rhs = r.rstrip().split("=")
-                except: continue
-                
-                type_fun = type(getattr(W, lhs))
-                setattr(W, lhs, type_fun(rhs))
-            time.sleep(1)
-
-
-
+    command = "?STATUS"
 
 
 class Status(HasTraits):
+    UTC = String()
     Telescope_ID = Int()
     Telescope_Control_Status = String()
     Lamp_Status = String()
-    Lamp_Curent = Float()
+    Lamp_Current = Float()
     Dome_Shutter_Status = String()
     WS_Motion_Mode = String()
     Dome_Motion_Mode = String()
@@ -331,6 +408,7 @@ class Status(HasTraits):
     HA_Axis_Soft_Limit_Status = String()
     Dec_Axis_Soft_Limit_Status = String()
     Horizon_Soft_Limit_Status = String()
+    comms_thread = Instance(StatusCommsThread)
     
     def __init__(self):
         log.info("Status thread initalized")
@@ -341,35 +419,9 @@ class Status(HasTraits):
             raise TCSConnectionError(e)
             
         self.comms_thread = StatusCommsThread()
-        self.comms_thread.weather = self
+        self.comms_thread.resultobj = self
     
         
-class StatusCommsThread(Thread):
-    abort = False
-
-        
-    def run(self):       
-        W = self.weather 
-        while not self.abort:
-            try:
-                W.telnet.write("?WEATHER\n")
-            except Exception as e:
-                raise TCSReadError(e)
-                
-            while True:
-
-                r= W.telnet.read_until("\n", .1)
-
-                if r == "":
-                    break               
-
-                try:lhs,rhs = r.rstrip().split("=")
-                except: continue
-                
-                type_fun = type(getattr(W, lhs))
-                setattr(W, lhs, type_fun(rhs))
-            time.sleep(1)
-
 
 class StatusThreads():
     '''
@@ -379,6 +431,7 @@ class StatusThreads():
     telescope  = None
     weather = None
     status = None
+    started = False
     
     def __init__(self):
         log.info("StatusThreads initialized")
@@ -386,5 +439,20 @@ class StatusThreads():
         self.weather = Weather()
         self.status = Status()
     
-        self.telescope.run()
-
+    def start(self):
+        
+        if not self.started:
+            log.info("Starting threads")
+            self.telescope.comms_thread.start()
+            self.weather.comms_thread.start()
+            self.status.comms_thread.start()
+            self.started = True
+    
+    def stop(self):
+        if self.started:
+            self.telescope.comms_thread.abort= True
+            self.weather.comms_thread.abort= True
+            self.status.comms_thread.abort= True
+            self.started = False
+        
+        self.telescope.UTC = self.weather.UTC = self.status.UTC = ''

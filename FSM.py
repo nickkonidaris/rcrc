@@ -29,14 +29,85 @@ Constants = {
     'config_flats_timeout': 10*mn
 }
 
+Status = GXN.StatusThreads()
 
 
-
+def classname(object):
+    return object.__class__.__name__
 
 def get_input():
-    pass
+    log.debug("Called get_input")
+    status = {}
+    
+    for object in [Status.weather, Status.telescope, Status.status]:
+        for trait in object.traits():
+            
+            cn = classname(object)
+            try:
+                if cn not in status:
+                    status[cn] = {trait: object.__getattribute__(trait)}
+                else:
+                    status[cn][trait] = object.__getattribute__(trait)
+            except AttributeError:
+                pass
+    
+    return status        
+
+
+def is_sun_ok(status):
+    '''Returns true if sunlight status OK'''
+    
+    s = status['Status']['Sunlight_Status'] == 'OKAY'
+    
+    if s: log.info("Sunlight status is OK")
+    else: log.info("Sunlight status is OK")
+    return s
+
+def is_lamp_off(status):
+    '''Returns true if lamp is off'''
+    
+    s = status['Status']['Lamp_Status'] == 'OFF'
+    
+    if s: log.info("Lamps are off")
+    else: log.info("Lamps are on")
+    return s
+    
+def is_weather_safe(status):
+    '''Returns true if weather status is OK'''
+    
+    s = status['Status']['Weather_Status'] == 'OKAY'
+    
+    if s: log.info("Weather status OK")
+    else: log.info("Weather not safe")
+    return s
+
+def is_telescope_in_instrument_mode(status):
+    '''Returns true if telescope is in instrument (not manual) mode'''
+    
+    s = status['Status']['Telescope_Control_Status']
+    
+    if s == 'AVAILABLE':
+        log.info("Telescope is available")
+        return True
+    else:
+        log.info("Telescope in manual mode")
+        return False
+    
+    
+def is_telescope_powered(status):
+    ''' Returns true if telescope is powered on'''
+    if  (s['Oil_Pad_Status'] == 'READY') and \
+        (s['Telescope_Power_Status'] == 'READY'):
+            log.info("Telescope is powered")
+            return True
+    else:
+        log.info("Telescope is not powered")
+        return False
 
 def go():
+    global Status
+    
+    Status.start()
     
     curr_state = None
     next_state = "startup"
