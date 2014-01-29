@@ -8,22 +8,14 @@
 #
 
 from datetime import datetime, timedelta
-import logging 
-import logging.config
-
-
-
-logging.config.fileConfig('/Users/npk/Dropbox/SED Machine/Project/RC Robotic Control/logging.conf')
+import logging as log
 
 # create logger
-logger = logging.getLogger('sedm')
+log.basicConfig(filename="C:\\sedm\\logs\\rcrc.txt",
+    format="%(asctime)s-%(filename)s:%(lineno)i-%(levelname)s-%(message)s",
+    level = log.DEBUG)
 
-# 'application' code
-logger.debug('debug message')
-logger.info('info message')
-logger.warn('warn message')
-logger.error('error message')
-logger.critical('critical message')
+log.info("?***************************** START ********")
 
 
 mn = 60
@@ -36,42 +28,91 @@ Constants = {
 def go():
     
     curr_state = None
-    next_state = Startup()
+    next_state = "startup"
     
     theSM = StateMachine()
-    now = datetime.now()
     
     i = 0
-    while i < 100:
+    while i < 5:
         
-        inputs = get_inputs()
+        inputs = 0
         theSM.execute(inputs)
         i += 1
+    
+    return theSM
 
 class State(object):
+    elapsed = timedelta(0) # length of time in the state
+    n_times = 0 # Number of times executed
+    
     def __init__(self):
-        logger.info("Initialized state '%s'" % self.__class__.__name__)
+        log.info("Initialized state '%s'" % self.__class__.__name__)
         print "Hi"
-    elapsed = timedelta(0)
+
+    
+    def execute(self, inputs):
+        log.info("[%s].execute()" % self.__class__.__name__)
 
 class startup(State):
     def __init__(self):
         State.__init__(self)
+    
+    
+    def execute(self, inputs):
+        State.execute(self, inputs)
+        d = datetime.now()
+        
+        h,m = d.hour, d.minute
+        
+        return "startup"
+        
+        if h < 3:
+            return "startup"
+        elif (h < 5) and (m < 30):
+            return "configure_flats"
+        else:
+            return "focus"
+        
 
-class StateMacine:
-    statetable = []
-    curr_state = None
-    next_state = None
+class configure_flats(State):
+    def __init__(self):
+        State.__init__(self)
+
+class StateMachine:
+    # statetable is initialized dynamically by programatically
+    # identifying sub classes of class State/
+    statetable = {}
+    prev_state_name = None
+    next_state_name = None
+    
+    
     
     def __init__(self):
-        statetable
+        log.info("Initializing StateMachine and all states...")
+        states = State.__subclasses__()
+        for state in states:
+            self.statetable[state.__name__] = state()
+        
+        log.info("All states initialized.")
+        
+        self.prev_state_name = None
+        self.next_state_name = "startup"
     
-    def execute(self):
+    def execute(self, inputs):
         
         now = datetime.now()
-        self.next_state = self.curr_state.execute()
+        ns = self.statetable[self.next_state_name]
+        
+        self.prev_state_name = self.next_state_name
+        self.next_state_name = ns.execute(inputs)
+        
         elapsed = datetime.now() - now
-        self.curr_state.elapsed += elapsed 
+        ns.elapsed += elapsed
+        ns.n_times += 1
+        
+        
         
             
-        
+
+if __name__ == '__main__':
+    sm=go()    
