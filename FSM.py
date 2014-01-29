@@ -9,6 +9,11 @@
 
 from datetime import datetime, timedelta
 import logging as log
+import telnetlib
+import smtplib
+import GXN
+
+email_list = ["nick.konidaris@gmail.com"]
 
 # create logger
 log.basicConfig(filename="C:\\sedm\\logs\\rcrc.txt",
@@ -25,6 +30,12 @@ Constants = {
 }
 
 
+
+
+
+def get_input():
+    pass
+
 def go():
     
     curr_state = None
@@ -35,11 +46,45 @@ def go():
     i = 0
     while i < 5:
         
-        inputs = 0
-        theSM.execute(inputs)
+        try:
+            inputs = 0
+            theSM.execute(inputs)
+        except TCSConnectionError:
+            log.info("Caught a communication error. Rebooting computer.")
+            return
+            import os
+            email(email_list, """Sed machine cannot communicate with TCS. The
+            instrument will attempt to reboot and continue. Sorry for the spam.""")
+            log.info("executing shutdown -r")
+            os.system("shutdown -r")
+
         i += 1
     
     return theSM
+
+
+def email(to, message):
+    FROM = "palomar.sed.machine@gmail.com"
+    SUBJECT = "SEDM News"
+    
+    header = "\r\n".join(
+        ["from: %s" % FROM,
+        "subject: %s" % SUBJECT,
+        "to: %s" % ", ".join(to),
+        "mime-version: 1.0",
+        "content-type: text/html"])
+    
+    email = header + "\r\n\r\n" + message
+    
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.ehlo()
+    server.starttls()
+    server.login("palomar.sed.machine", "palomar rules")
+    
+    log.info("Emailing") 
+    log.info(email)
+    server.sendmail("palomar.sed.machine", to, email)
+    server.quit()
 
 class State(object):
     elapsed = timedelta(0) # length of time in the state
@@ -47,13 +92,14 @@ class State(object):
     
     def __init__(self):
         log.info("Initialized state '%s'" % self.__class__.__name__)
-        print "Hi"
 
     
     def execute(self, inputs):
         log.info("[%s].execute()" % self.__class__.__name__)
 
 class startup(State):
+    '''Entry point state'''
+    
     def __init__(self):
         State.__init__(self)
     
@@ -66,13 +112,23 @@ class startup(State):
         
         return "startup"
         
-        if h < 3:
+        if inputs['telinit_needed']:
+            return "telinit"
+        elif h < 3:
             return "startup"
         elif (h < 5) and (m < 30):
             return "configure_flats"
         else:
             return "focus"
         
+
+class telinit(State):
+    def __init__(self):
+        State.__init__(self)
+            
+    def execute(self, inputs):
+        
+        pass
 
 class configure_flats(State):
     def __init__(self):
