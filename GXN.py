@@ -16,16 +16,15 @@ import time
 import numpy as np
 import logging as log
 
+import astropy
+from astropy.coordinates import Angle
+
 PELE = "198.202.125.194"
 PELEPORT = 49300
 
 log.basicConfig(filename="C:\\sedm\\logs\\rcrc.txt",
     format="%(asctime)s-%(filename)s:%(lineno)i-%(levelname)s-%(message)s",
     level = log.DEBUG)
-
-
-
-
 
 class TCSConnectionError(Exception):
     def __init__(self, value):
@@ -66,6 +65,7 @@ class Commands:
         try:
             self.T = telnetlib.Telnet(PELE, PELEPORT)
         except Exception as e:
+            log.error("GXN TCS Connection Error: %s" % e)
             raise TCSConnectionError(e)
             
         log.info("Connection to %s made" % PELE)
@@ -83,7 +83,7 @@ class Commands:
         T = self.T
         try:
             r=T.read_until(s, timeout)
-        except:
+        except Exception as e:
             raise TCSReadError(e)
         log.info("GXN Cmd returned: '%s'" % r.rstrip())
     
@@ -141,21 +141,43 @@ class Commands:
         self.write("stow 0.0 85.0 90\n")
         
         return self.slow(300)
+    
+    def lamps_on(self):
+        log.info("GXN lamp on")
+        self.write("lampon\n")
+        self.slow(30)
+    
+    def lamps_off(self):
+        log.info("GXN lamp off")
+        self.write("lampoff\n")
+        self.read_until("\n", .1)
         
-    def coords(self, ra, # in decimal horus
+    def open_dome(self):
+        log.info("GXN open dome")
+        self.write("open\n")
+        self.slow(300)
+        
+    def coords(self, ra, # in decimal hours
                     dec, # in decimal degrees
                     equinox, # 0 means apparent
                     ra_rate, dec_rate, 
                     flag, # adjusts rates. 0: 0.0001sec/yr, 1,2: as/hr
                     epoch=None): # for non sidereal
-
+        
+        
+        aRa = Angle(ra)
+        aDec = Angle(dec)
+        
+        hRA  = aRa.hour
+        dDec = aDec.deg
+        
         log.info("GXN coords")
         if epoch is not None:
             self.write("coords %f %f %f %f %f %i %f\n" %
-                (ra, dec, equinox, ra_rate, dec_rate, flag, epoch))
+                (hRA, dDec, equinox, ra_rate, dec_rate, flag, epoch))
         else:
             self.write("coords %f %f %f %f %f %i\n" %
-                (ra, dec, equinox, ra_rate, dec_rate, flag))
+                (hRA, dDec, equinox, ra_rate, dec_rate, flag))
         
         self.read_until("\n", .1)
     
