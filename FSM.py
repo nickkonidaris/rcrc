@@ -7,25 +7,41 @@
 #   This module is a simple state machine
 #
 
-import time
+from astropy.table import Table
+from astropy.coordinates import Angle
+
+import ctypes
 from datetime import datetime, timedelta
-import logging as log
-import telnetlib
-import smtplib
-import GXN
-import subprocess
-import xmlrpclib
+import ExposureSet
+import Focus
 import gui
+import GXN
+import logging as log
+import numpy
+import smtplib
+import SimpleQueue
 from threading import Thread
+import time
+
 
 email_list = ["nick.konidaris@gmail.com"]
 
 
 # Global Variables
-Status = 0
-rc_pid = 0
+
+Status = GXN.StatusThreads()
+
 theSM =0
-rc_gui=0
+
+rc_camera = None
+next_target = []
+target_plan = []
+#last_focus = [datetime(2010, 1, 1, 1, 1, 1) , 14.3]
+last_focus = [datetime.now() , 14.38]
+stop_loop = False
+
+force_focus = False
+
 
 # create logger
 log.basicConfig(filename="C:\\sedm\\logs\\rcrc.txt",
@@ -41,18 +57,20 @@ Constants = {
     'config_flats_timeout': 10*mn,
     'hours_before_sunset_to_calibrate': 6,
     'lamp_flat_exposure_time_s': 7,
-    'number_lamp_exposures': 1
-    
+    'number_lamp_exposures': 15,
+    'Hours_between_focus': 3,
+    'number_bias_exposures': 10,
+    'number_dark_exposures': 3,    
+    'dark_exposure_time': 180
 }
 
-Status = GXN.StatusThreads()
-GXNCmd = GXN.Commands()
+
 
 def classname(object):
     return object.__class__.__name__
 
 def get_input():
-    log.debug("Called get_input")
+
     status = {}
     
     status['OK'] = False
@@ -82,7 +100,7 @@ def get_input():
     sunup = (hm < sunset_hm) or (hm > sunrise_hm)
     
     status['Status']['Sun_Is_Up']= sunup
-    if sunup: log.info("Sun is up")
+    if sunup: log.debug("Sun is up")
     
     # Calibration time is 2 hours before sunrise
     calibration_h = sunset_h-Constants['hours_before_sunset_to_calibrate']
@@ -90,19 +108,15 @@ def get_input():
     
     if calibration_h <= 0: calibration_h += 24
     
-    a = h+m/60.
-    b = (calibration_h+calibration_m/60.)
     calibration_hm = calibration_h + calibration_m/60.
     calibration_time = (hm >= calibration_hm) or (hm < sunset_hm)
 
 
     if calibration_time: 
-        log.info("Time to calibrate")
+        log.debug("Time to calibrate")
         status['Status']['Calibration_Time'] = True
     else: 
         status['Status']['Calibration_Time'] = False
-        log.info("Will begin calibrations at %2.2i:%2.2i UT" % (calibration_h,
-        calibration_m))
     
     
     # Observe time
@@ -140,6 +154,12 @@ def is_sun_ok(status):
     
     return s
 
+
+def is_telescope_tracking(status):
+    '''Returns true if telescope is tracking'''
+    
+    return status['Telescope']['Status'] == 'TRACKING'
+    
 def is_lamp_off(status):
     '''Returns true if lamp is off'''
     
@@ -244,14 +264,16 @@ class DomeOpenState(object):
         
     def execute(self, prev_state_name, inputs):
         
+        log.info("Is Weather safe? %s" % is_weather_safe(inputs))
         if not is_weather_safe(inputs):
+            log.info("[%s] is in weather safe mode" % self.__class__.__name__)
             return "weather_safe"
         
         if not is_sun_ok(inputs):
             return "close"
         
         log.info("[%s].execute()" % self.__class__.__name__)            
-
+        return ""
 
 def check_basics(inputs):
     ''' Check to see if the telescope is ready for basic observations'''
@@ -297,9 +319,13 @@ class telinit(State):
     def execute(self, prev_state_name, inputs):
         State.execute(self, prev_state_name, inputs)
         
-        cmd = GXNCmd
-        try: cmd.telinit()
-        except: return "telinit_failed"
+        try: 
+            cmd = GXN.Commands()
+            cmd.telinit()
+            cmd.close()
+        except: 
+            cmd.close()
+            return "telinit_failed"
         
         return "startup"
         
@@ -326,13 +352,21 @@ class configure_flats(State):
     def execute(self, prev_state_name, inputs):
         State.execute(self, prev_state_name, inputs)
         
-        #cmd = GXN.Commands()
-        #cmd.takecontrol()
-        try: GXNCmd.lamps_on()
-        except: return "lampson_failed"
+        try: 
+            log.info("Turning on lamps..")
+            GXNCmd = GXN.Commands()
+            GXNCmd.lamps_on()
+            GXNCmd.close()
+        except: 
+            return "lampson_failed"
         
-        try: GXNCmd.stow_flats()
-        except: return "stow_failed"
+        try: 
+            GXNCmd = GXN.Commands()
+            GXNCmd.stow_flats()
+            GXNCmd.close()
+        except:
+            GXNCmd.close()
+            return "stow_failed"
         
         return "take_flats"
 
@@ -344,15 +378,42 @@ class take_flats(State):
         global rc_gui
         State.execute(self, prev_state_name, inputs)
         
-        cmd = GXNCmd
 
-        rc_gui.object = "Flat"
+        rc_camera.object = "Flat"
+        rc_camera.shutter = "normal"
         for i in range(Constants['number_lamp_exposures']):
-            expose(Constants['lamp_flat_exposure_time_s'])
+            try:
+                expose(Constants['lamp_flat_exposure_time_s'])
+            except gui.ExposureCommsProblem:
+                return "detector_problem"
             time.sleep(1)
-                        
+          
+        try: 
+            GXNCmd = GXN.Commands()
+            GXNCmd.lamps_off()
+            GXNCmd.close()
+        except:
+            GXNCmd.close()
+            
         return "check_take_flats"
 
+class detector_problem(State):
+    def __init__(self):
+        State.__init__(self)
+    
+    def execute(self, prev_state_name, inputs):
+        State.execute(self, prev_state_name, inputs)
+        
+        cmd = GXN.Commands()
+        cmd.stop()
+        cmd.close_dome()
+        cmd.close()
+        log.error("Major detector problem identified. Could be unplugged or system may require reboot")
+        # email people here
+        
+        time.sleep(2000)
+        return "detector_problem"
+        
 class check_take_flats(State):
     def __init__(self):
         State.__init__(self)
@@ -360,7 +421,38 @@ class check_take_flats(State):
     def execute(self, prev_state_name, inputs):
         State.execute(self, prev_state_name, inputs)
         
+        return "take_darks"
+
+class take_darks(State):
+    def __init__(self):
+        State.__init__(self)
+    
+    def execute(self, prev_state_name, inputs):
+        State.execute(self, prev_state_name, inputs)
+        
+        rc_camera.object = "bias"
+        rc_camera.shutter = "closed"
+        for i in range(Constants['number_bias_exposures']):
+            try:
+                expose(0)
+            except gui.ExposureCommsProblem:
+                return "detector_problem"
+            time.sleep(1)
+        
+        rc_camera.object = "dark"
+
+        for i in range(Constants['number_dark_exposures']):
+            try:
+                expose(Constants['dark_exposure_time'])
+            except gui.ExposureCommsProblem:
+                return "detector_problem"
+            
+            time.sleep(1)
+        
+        rc_camera.shutter = "normal"
+
         return "waitfor_sunset"
+        
 
 class waitfor_sunset(State):
     def __init__(self):
@@ -393,12 +485,39 @@ class open_dome(State):
         
         
         if not is_dome_open(inputs):
-            try: GXNCmd.open_dome()
+            try: 
+                cmd = GXN.Commands()
+                cmd.open_dome()
+                cmd.close()
             except:
+                cmd.close()
                 return "open_dome_failed"
         
         return "observe"
 
+class weather_safe(State):
+    def __init__(self):
+        State.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        State.execute(self, prev_state_name, inputs)
+        
+        new_state = check_basics(inputs)
+        if new_state != '': return new_state
+        
+        if is_telescope_tracking(inputs):
+            try:
+                cmd = GXN.Commands()
+                cmd.stop()
+                cmd.close()
+            except:
+                cmd.close()
+                
+        if not is_weather_safe(inputs):
+            time.sleep(10)
+            return "weather_safe"
+        
+        return "observe"
 
 ## DOME Open States
 
@@ -407,15 +526,193 @@ class observe(DomeOpenState):
         DomeOpenState.__init__(self)
         
     def execute(self, prev_state_name, inputs):
-        DomeOpenState.execute(self, prev_state_name, inputs)
+        ns = DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
             
         if is_ok_to_observe(inputs):
+            if not is_dome_open(inputs):
+                return "open_dome"
+
             return "select_target"
 
-        
         time.sleep(10)
         return "observe"
+
         
+class select_target(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+        
+        global next_target, target_plan
+        
+        lst = inputs['Telescope']['LST']
+        log.debug("SimpleQueue.select_next_target at %s" % lst)
+        next_target = SimpleQueue.select_next_target(lst)
+        
+        if next_target[0] is None:
+            log.debug("No target found")
+            time.sleep(20)
+            return "select_target"
+        
+        times = {"u": next_target['u'],
+                    "g": next_target['g'],
+                    "r": next_target['r'],
+                    "i": next_target['i']}
+        target_plan = ExposureSet.create_target_plan(times)
+        log.info("Created new plan: %s" % target_plan)
+    
+        return "slew_to_target"
+
+class slew_to_target(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+        global next_target, last_focus
+        
+        
+        try:
+            cmd = GXN.Commands()
+            cmd.coords( next_target[1], 
+                        next_target[2],
+                        next_target[3],
+                        0, 0, 0)
+            cmd.go()
+            cmd.close()
+        except:
+            cmd.close()
+            return "slew_failed"
+                
+        time_since_last_focus = datetime.now() - last_focus[0]
+        log.info("Time since last focus %i s" % time_since_last_focus.seconds)
+        if time_since_last_focus.seconds > Constants['Hours_between_focus']*60*60:
+            return "secfocus_loop"
+        
+        if force_focus:
+            force_focus = False
+            log.info("Forced to focus")
+            return "secfocus_loop"
+        
+        return "exposure_handler"
+
+class exposure_handler(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        global next_target, target_plan
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+        
+        log.info("Remaining plan is: %s" % str(target_plan))
+        
+        if len(target_plan) == 0:
+            return 'observe'
+            
+        return target_plan[0][0]
+        
+class expose_target(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        global next_target, target_plan
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+        
+        plan = target_plan[0]
+        del target_plan[0]
+        
+        target_name=next_target[0]
+        fltr = plan[2]
+        itime = plan[1]
+        rc_camera.object = "%s: %s" % (target_name, fltr)
+        log.info("Exposing on %s in filter %s for %i s" % (target_name,
+            fltr, itime))
+        
+        rc_camera.shutter = "normal"
+        try:
+            expose(itime)
+        except gui.ExposureCommsProblem:
+            return "detector_problem"
+            
+        log.info("Exposure complete")
+        
+        return "exposure_handler"
+
+class filter_move(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        global next_target, target_plan
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+
+        plan = target_plan[0]
+        del target_plan[0]
+        
+        dRA, dDec = plan[1]
+        log.info("Moving %i %i" % (dRA, dDec))
+                
+        try:
+            cmds = GXN.Commands()
+            cmds.pt(dRA, dDec)
+            cmds.close()
+        except:
+            log.info
+        
+        return "exposure_handler"
+
+class secfocus_loop(DomeOpenState):
+    def __init__(self):
+        DomeOpenState.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        global last_focus
+        ns=DomeOpenState.execute(self, prev_state_name, inputs)
+        if ns != '': return ns
+            
+
+        try:
+            cmd = GXN.Commands()
+            
+            positions = numpy.arange(14.1, 14.4, 0.025)
+            filenames = []
+            
+            rc_camera.object = "Focus Loop"        
+            cmd.gofocus(13)
+            rc_camera.shutter = "normal"
+            for position in positions:
+                cmd.gofocus(position)
+                try:
+                    expose(15)
+                except:
+                    return "restart_detector_software"
+                filenames.append(rc_camera.filename)
+            
+            log.info("FN: %s" % str(filenames))
+            fpos, fposs, metrics = Focus.rc_focus_check(filenames)
+            
+            log.info("In the range of: %s" % positions)
+            log.info("Metrics: %s" % metrics)
+            log.info("Best focus is %f" % fpos)
+            last_focus = [datetime.now(), fpos]
+            cmd.gofocus(fpos)
+            cmd.close()
+        except:
+            cmd.close()
+            return "focus_failed"
+        
+        return "exposure_handler"
+        
+
 class telescope_not_powered(State):
     def __init__(self):
         State.__init__(self)
@@ -427,21 +724,7 @@ class telescope_not_powered(State):
         if prev_state_name != 'telescope_not_powered':
             log.error("Telescope is not powered. Emailing people")
         
-        return check_basics(inputs)
-
-
-
-class telescope_not_powered(State):
-    def __init__(self):
-        State.__init__(self)
-    
-    
-    def execute(self, prev_state_name, inputs):
-        State.execute(self, prev_state_name, inputs)
-        
-        if prev_state_name != 'telescope_not_powered':
-            log.error("Telescope is not powered. Emailing people")
-        
+        time.sleep(20)
         return check_basics(inputs)
 
 class telescope_not_in_instrument_mode(State):
@@ -455,6 +738,7 @@ class telescope_not_in_instrument_mode(State):
         if prev_state_name != 'telescope_not_in_instrument_mode':
             log.error("Telescope is not in instrument mode. Emailing people")
         
+        time.sleep(20)
         return check_basics(inputs)
 
 class StateMachine:
@@ -485,7 +769,6 @@ class StateMachine:
         ns = self.statetable[self.next_state_name]
         
         log.info("Executing %s" % self.next_state_name)
-        print self.next_state_name
         self.prev_state_name = self.next_state_name
         self.next_state_name = ns.execute(self.prev_state_name, inputs)
         
@@ -496,55 +779,59 @@ class StateMachine:
         elapsed = datetime.now() - now
         ns.elapsed += elapsed
         ns.n_times += 1
+        
+        dt = datetime.now()
+        fn = "%4.4i_%2.2i_%2.2i.txt" % (dt.year, dt.month, dt.day)
+        names = []
+        times = []
+        elapsed = []
+        for statename, state in self.statetable.items():
+            names.append(statename)
+            times.append(state.n_times)
+            elapsed.append(state.elapsed.seconds)
+        
+        table = Table([names, times, elapsed], 
+            names=("State", "# times", "# sec"))
+        table.write("s:/logs/states/%s" % fn, format="ascii.fixed_width_two_line")
+            
 
 def expose(itime):
-    global rc_gui
+    global rc_camera
     
-    rc_gui.exposure = itime
+    rc_camera.exposure = itime
     log.info("Exposing for %3.1f s" % (itime))
-    print "Exposing for %3.1f s" % itime
-    rc_gui._go_button_fired()
-    time.sleep(1)
+    rc_camera.run()
+
         
-    while rc_gui.int_time < (rc_gui.exposure + 3):
-        time.sleep(0.5)
+def start_software():
+    global Status, theSM, rc_camera
+
+    rc_camera = gui.Camera()
+    rc_camera.status_function = get_input
+    rc_camera.xpa_class = 'c6ca7de8:1962'
+    rc_camera.readout=2.0
+        
+    rc_camera.make_connection()
+
+
     
-    time.sleep(2)
-    rc_gui.int_time = 0
-        
+    
 def main():
-    global Status, rc_pid, rc_gui, theSM
+    global Status, rc_camera, theSM
     
     Status.start()
     time.sleep(1)
     
-    curr_state = None
-    next_state = "startup"
-    
     theSM = StateMachine()
-    sedmpy = "C:/Users/sedm/Dropbox/Python-3.3.0/PCbuild/amd64/python.exe"
-
-    rc_pid = subprocess.Popen([sedmpy, "c:/sw/sedm/camera.py", "-rc"])
-    time.sleep(0.5),
-    rc_con = xmlrpclib.ServerProxy("http://127.0.0.1:8001")
-    time.sleep(2)
-    
-    rc_gui, rc_view = gui.gui_connection(rc_con, 'rc', get_input)
-    rc_gui.configure_traits(view=rc_view)
-
-    rc_gui._shutter_changed()
-    rc_gui.update_settings()
-    rc_gui.xpa_class = 'c6ca7de8:18387'
+    start_software()
 
 def fsm_loop():
-    global Status, rc_pid, theSM
-    i = 0
-    GXNCmd.takecontrol()
-    while i < 100:
+    global Status, rc_pid, theSM, stop_loop
+    #GXNCmd.takecontrol()
+    while stop_loop == False:
         try:
             inputs = get_input()
             theSM.execute(inputs)
-            time.sleep(.5)
         except GXN.TCSConnectionError:
             log.info("Caught a communication error. Rebooting computer.")
             return
@@ -553,10 +840,11 @@ def fsm_loop():
             instrument will attempt to reboot and continue. Sorry for the spam.""")
             log.info("executing shutdown -r")
             #os.system("shutdown -r")
-
-        i += 1
+    
+    log.info("Received and accepted a stop request")
 
 
 if __name__ == '__main__':
     main()
+    #fsm_loop()
     Thread(target=fsm_loop).start()

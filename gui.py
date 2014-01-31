@@ -1,19 +1,22 @@
 
 from traits.api import *
-from traitsui.api import View, Item, Handler
 
-from threading import Thread, Timer
-
-import numpy as np
-import pyfits as pf
-import os
-import sys
+from threading import Thread
+import ctypes
 from httplib import CannotSendRequest
-import time
-import tempfile
-import winsound
-
+import numpy as np
+import logging as log
+import os
+import pyfits as pf
+import socket
+import subprocess
 from subprocess import check_output
+import time
+import winsound
+import xmlrpclib
+
+
+
 
 def ra_to_deg(ra):
     h,m,s = map(float,ra.split(":"))
@@ -30,7 +33,7 @@ def dec_to_deg(dec):
 def ds9_image(xpa_class,  filename):
     
     if xpa_class is None:
-        print "Can not autodisplay image"        
+        log.info("Can not autodisplay image")
         return
         
     retains = ["scale mode", "scale", "cmap",  "zoom", "pan to"]
@@ -56,8 +59,8 @@ def ds9_image(xpa_class,  filename):
     #check_output("c:\\ds9\\xpaset -p %s cmap invert yes" % (xpa_class), shell=True)
     except Exception as e:
         #FIXME
-        print "Skipping exception:"
-        print e
+        
+        
         pass
 
 def play_sound(snd="SystemAsterix"):
@@ -69,189 +72,24 @@ def play_sound(snd="SystemAsterix"):
     except:
         pass
 
-class IncrementThread(Thread):
-    stop = False
-    def run(self):
-        
-        self.camera.int_time = 0
-        
-        while not self.stop:
-            self.camera.int_time += 1
-            
-            if self.camera.readout == 2: overhead = 6
-            else: overhead = 50
-            
-            if self.camera.int_time > (self.camera.exposure+overhead):
-                play_sound("SystemAsterisk")
-            time.sleep(1)
 
-class ExposureThread(Thread):
-    def run(self):
-        nexp = self.camera.num_exposures
-        while self.camera.num_exposures > 0:
-            
-            hdrvalues_to_update = []
-            
-            stats = self.camera.status_function()
-            header_vals = {}
-            
-            #flatten variables for header
-            for stat, stat_item in stats.items():
-                if type(stat_item) == dict:
-                    for k,v in stat_item.items():
-                        header_vals[k] = v
-            
-            for k,v in header_vals.items():
-                if type(v) in [float, int, str]:
-                    hdrvalues_to_update.append((k,v))
-
-                                
-            try:
-                self.camera.state = "Exposing..."
-                IT = IncrementThread()
-                IT.camera = self.camera
-                IT.start()
-                filename = self.camera.connection.acquire().data
-                IT.stop = True
-            except:
-                self.camera.state = "Exposure Failed due to communications problem"
-                return
-                
-            self.camera.filename = filename
-            self.camera.state = "Updating Fits %s" % filename
-            try:
-                hdus = pf.open(filename)
-                hdr = hdus[0].header
-                hdr.update("OBJECT",self.camera.object)
-            except:
-                self.camera.state = "Could not open raw fits"
-                return
-            
-
-            for el in hdrvalues_to_update:
-                trait, val = el
-                #print trait, val
-                try: hdr.update(trait, val)
-                except: pass
-            
-            if self.camera.name == 'ifu':
-                if self.camera.amplifier == 1:
-                    if self.camera.readout == 0.1:
-                        if self.camera.gain == 1: gain = 3.29
-                        if self.camera.gain == 2: gain = 1.78
-                        if self.camera.gain == 3: gain = 0.89
-                    if self.camera.readout == 2:
-                        if self.camera.gain == 1: gain = 3.49
-                        if self.camera.gain == 2: gain = 1.82
-                        if self.camera.gain == 3: gain = 0.90
-                if self.camera.amplifier == 2:
-                    if self.camera.readout == 0.1:
-                        if self.camera.gain == 1: gain = 14.72
-                        if self.camera.gain == 2: gain = 7.03
-                        if self.camera.gain == 3: gain = 3.49
-                    if self.camera.readout == 2:
-                        if self.camera.gain == 1: gain = 13.92
-                        if self.camera.gain == 2: gain = 6.88
-                        if self.camera.gain == 3: gain = 3.43
-            elif self.camera.name == 'rc':
-                if self.camera.amplifier == 1:
-                    if self.camera.readout == 0.1:
-                        if self.camera.gain == 1: gain = 3.56
-                        if self.camera.gain == 2: gain = 1.77
-                        if self.camera.gain == 3: gain = 0.90
-                    if self.camera.readout == 2:
-                        if self.camera.gain == 1: gain = 3.53
-                        if self.camera.gain == 2: gain = 1.78
-                        if self.camera.gain == 3: gain = 0.88
-                if self.camera.amplifier == 2:
-                    if self.camera.readout == 0.1:
-                        if self.camera.gain == 1: gain = 14.15
-                        if self.camera.gain == 2: gain = 7.27
-                        if self.camera.gain == 3: gain = 3.79
-                    if self.camera.readout == 2:
-                        if self.camera.gain == 1: gain = 14.09
-                        if self.camera.gain == 2: gain = 7.02
-                        if self.camera.gain == 3: gain = 3.52
-                        
-            hdr.update("GAIN", gain, 'gain in e-/ADU')
-            if self.camera.stage_connection is not None:
-                try:
-                    hdr.update("IFUFOCUS", 
-                        self.camera.stage_connection.position_query(),
-                        "focus stage position in mm")
-                except CannotSendRequest:
-                    hdr.update("IFUFOCUS", 
-                        self.camera.stage_connection.position_query(),
-                        "focus stage position in mm")
+class ExposureCommsProblem(Exception):
+    def __init__(self, value):
+        self.value = value
+        log.error("Could not take exposure: %s" % value)
     
-    
-            hdr.update("CHANNEL", self.camera.name, "Instrument channel")
-            hdr.update("TNAME", self.camera.target_name, "Target name")
-            
-            if self.camera.name == 'rc':
-                hdr.update("CRPIX1", 1293, "Center pixel position")
-                hdr.update("CRPIX2", 1280, "")
-                hdr.update("CDELT1", -0.00010944, "0.394 as")
-                hdr.update("CDELT2" ,-0.00010944, "0.394 as")
-                hdr.update("CTYPE1", "RA---TAN")
-                hdr.update("CTYPE2", "DEC--TAN")
-                hdr.update("CRVAL1", ra_to_deg(hdr["RA"]), "from tcs")
-                hdr.update("CRVAL2", dec_to_deg(hdr["Dec"]), "from tcs")
-            elif self.camera.name == 'ifu':
-                hdr.update("CRPIX1", 1075, "Center pixel position")
-                hdr.update("CRPIX2", 974, "Center pixel position")
-                hdr.update("CDELT1", -0.0000025767, "0.00093 as")
-                hdr.update("CDELT2", -0.0000025767, "0.00093 as")
-                hdr.update("CTYPE1", "RA---TAN")
-                hdr.update("CTYPE2", "DEC--TAN")
-                as120 = 0.03333
-                hdr.update("CRVAL1", ra_to_deg(hdr["ra"]) - as120, "from tcs")
-                hdr.update("CRVAL2", dec_to_deg(hdr["dec"]) - as120, "from tcs")
-
-            new_hdu = pf.PrimaryHDU(np.uint16(hdus[0].data), header=hdr)
-            hdus.close()
-
-            tempname = "c:/users/sedm/appdata/local/temp/sedm_temp.fits"
-            origname = filename
-
-            
-            try: os.remove(tempname)
-            except WindowsError: pass
-            
-            try:
-                os.rename(origname, tempname)
-            except Exception as e:
-                print e
-                self.camera.state = "Rename %s to %s failed" % (filename, tempname)
-                play_sound("SystemExclamation")
-                return
-            
-            try:
-                new_hdu.writeto(filename)
-            except:
-                os.rename(tempname, filename)
-                self.camera.state = "Could not write extension [2]"
-                play_sound("SystemExclamation")
-                return
-                
-
-            play_sound("SystemAsterix")    
-            
-            ds9_image(self.camera.xpa_class,  filename)
-            self.camera.num_exposures -= 1
-        self.camera.num_exposures = 1
-        self.camera.state = "Idle"
-        if nexp > 1: play_sound("SystemExclamation")
-
+    def __str__(self):
+        return str(self.value)
+        
         
 class Camera(HasTraits):
     '''Exposure Control'''  
-    name = String("unknown")  
+    name = String("rc")  
     target_name = String()
     object = String
     connection = None #xmlrpclib object to connect to PIXIS camera
-    stage_connection = None #xmlrpclib object to connect to newport focus stage
-    
+    connection_pid = None
+
     state = String("Idle")
     filename = String("")
     
@@ -277,16 +115,185 @@ class Camera(HasTraits):
     
     exposure = Float(10, desc="the exposure time in s",
         label = "Exposure")
+        
+    def run(self):
+        nexp = self.num_exposures
+        while self.num_exposures > 0:
+            
+            hdrvalues_to_update = []
+            
+            stats = self.status_function()
+            header_vals = {}
+            
+            #flatten variables for header
+            for stat, stat_item in stats.items():
+                if type(stat_item) == dict:
+                    for k,v in stat_item.items():
+                        header_vals[k] = v
+            
+            for k,v in header_vals.items():
+                if type(v) in [float, int, str]:
+                    hdrvalues_to_update.append((k,v))
+
+
+            socket.setdefaulttimeout(self.exposure + 60)
+            number_acq_attempts = 2
+            while number_acq_attempts > 0:
+                try:
+                    filename = self.connection.acquire().data
+                    number_acq_attempts = 0
+                except Exception as e:
+                    log.info("Received exception %s" % e)
+                    self.make_connection()
+                        
+                    number_acq_attempts -= 1
+                    filename = ''
+                    
+            socket.setdefaulttimeout(None)
+            
+            if filename == '':
+                raise ExposureCommsProblem("Could not read camera, server keeps failing. Likely a hardware issue")
+            
+            if not os.path.exists(filename):
+                raise ExposureCommsProblem("Camera timed out. Likely a reconnect or reboot is needed.")
+                
+            self.filename = filename
+            self.state = "Updating Fits %s" % filename
+            try:
+                hdus = pf.open(filename)
+                hdr = hdus[0].header
+                hdr.update("OBJECT",self.object)
+            except:
+                self.state = "Could not open raw fits"
+                return
+            
+
+            for el in hdrvalues_to_update:
+                trait, val = el
+
+                try: hdr.update(trait, val)
+                except: pass
+            
+            if self.name == 'ifu':
+                if self.amplifier == 1:
+                    if self.readout == 0.1:
+                        if self.gain == 1: gain = 3.29
+                        if self.gain == 2: gain = 1.78
+                        if self.gain == 3: gain = 0.89
+                    if self.readout == 2:
+                        if self.gain == 1: gain = 3.49
+                        if self.gain == 2: gain = 1.82
+                        if self.gain == 3: gain = 0.90
+                if self.amplifier == 2:
+                    if self.readout == 0.1:
+                        if self.gain == 1: gain = 14.72
+                        if self.gain == 2: gain = 7.03
+                        if self.gain == 3: gain = 3.49
+                    if self.readout == 2:
+                        if self.gain == 1: gain = 13.92
+                        if self.gain == 2: gain = 6.88
+                        if self.gain == 3: gain = 3.43
+            elif self.name == 'rc':
+                if self.amplifier == 1:
+                    if self.readout == 0.1:
+                        if self.gain == 1: gain = 3.56
+                        if self.gain == 2: gain = 1.77
+                        if self.gain == 3: gain = 0.90
+                    if self.readout == 2:
+                        if self.gain == 1: gain = 3.53
+                        if self.gain == 2: gain = 1.78
+                        if self.gain == 3: gain = 0.88
+                if self.amplifier == 2:
+                    if self.readout == 0.1:
+                        if self.gain == 1: gain = 14.15
+                        if self.gain == 2: gain = 7.27
+                        if self.gain == 3: gain = 3.79
+                    if self.readout == 2:
+                        if self.gain == 1: gain = 14.09
+                        if self.gain == 2: gain = 7.02
+                        if self.gain == 3: gain = 3.52
+                        
+            hdr.update("GAIN", gain, 'gain in e-/ADU')
+            hdr.update("CHANNEL", self.name, "Instrument channel")
+            hdr.update("TNAME", self.target_name, "Target name")
+            
+            if self.name == 'rc':
+                hdr.update("CRPIX1", 1293, "Center pixel position")
+                hdr.update("CRPIX2", 1280, "")
+                hdr.update("CDELT1", -0.00010944, "0.394 as")
+                hdr.update("CDELT2" ,-0.00010944, "0.394 as")
+                hdr.update("CTYPE1", "RA---TAN")
+                hdr.update("CTYPE2", "DEC--TAN")
+                hdr.update("CRVAL1", ra_to_deg(hdr["RA"]), "from tcs")
+                hdr.update("CRVAL2", dec_to_deg(hdr["Dec"]), "from tcs")
+            elif self.name == 'ifu':
+                hdr.update("CRPIX1", 1075, "Center pixel position")
+                hdr.update("CRPIX2", 974, "Center pixel position")
+                hdr.update("CDELT1", -0.0000025767, "0.00093 as")
+                hdr.update("CDELT2", -0.0000025767, "0.00093 as")
+                hdr.update("CTYPE1", "RA---TAN")
+                hdr.update("CTYPE2", "DEC--TAN")
+                as120 = 0.03333
+                hdr.update("CRVAL1", ra_to_deg(hdr["ra"]) - as120, "from tcs")
+                hdr.update("CRVAL2", dec_to_deg(hdr["dec"]) - as120, "from tcs")
+
+            new_hdu = pf.PrimaryHDU(np.uint16(hdus[0].data), header=hdr)
+            hdus.close()
+
+            tempname = "c:/users/sedm/appdata/local/temp/sedm_temp.fits"
+            origname = filename
+
+            
+            try: os.remove(tempname)
+            except WindowsError: pass
+            
+            try:
+                os.rename(origname, tempname)
+            except Exception as e:
+                log.error("Rename %s to %s failed" % (filename, tempname))
+                self.state = "Rename %s to %s failed" % (filename, tempname)
+                play_sound("SystemExclamation")
+                return
+            
+            try:
+                new_hdu.writeto(filename)
+            except:
+                os.rename(tempname, filename)
+                self.state = "Could not write extension [2]"
+                play_sound("SystemExclamation")
+                return
+                
+
+            play_sound("SystemAsterix")    
+            
+            ds9_image(self.xpa_class,  filename)
+            self.num_exposures -= 1
+        self.num_exposures = 1
+        self.state = "Idle"
+        if nexp > 1: play_sound("SystemExclamation")
+
+    def make_connection(self):
+        sedmpy = "C:/Users/sedm/Dropbox/Python-3.3.0/PCbuild/amd64/python.exe"
+        
+        if self.connection_pid is not None:
+            ctypes.windll.kernel32.TerminateProcess(int(self.connection_pid._handle))
+        
+        try:    
+            self.connection_pid = subprocess.Popen([sedmpy, "c:/sw/sedm/camera.py", "-rc"])
+            time.sleep(0.5)
+            self.connection = xmlrpclib.ServerProxy("http://127.0.0.1:8001")
+        except:
+            raise ExposureCommsProblem("Could not make a detector connection.")
+
+        self.update_settings()
+        self.connection.set_shutter(self.shutter)
+
     
-    exposure_thread = Instance(ExposureThread)
-    
-    go_button = Button("Go")
-   
     def _gain_changed(self): self.update_settings()
     def _readout_changed(self): self.update_settings()
     def _amplifier_changed(self): self.update_settings()
     def _exposure_changed(self): self.update_settings()
-    def _shutter_changed(self):
+    def _shutter_changed(self): 
         self.connection.set_shutter(self.shutter)
         
         
@@ -298,64 +305,12 @@ class Camera(HasTraits):
             self.state = "DID NOT UPDATE. RETRY"
         except: 
             self.state = "DID NOT UPDATE. Retry"
-        
-    def _go_button_fired(self):
-        
-        if self.exposure_thread and self.exposure_thread.isAlive():
-            #print "alive"
-            return
-        else:
-            self.state = "Exposure requested"
-            try:
-
-                self.target_name = self.target_gui.name
-
-            except Exception as e:
-                pass
-
-            self.exposure_thread = ExposureThread()
-            self.exposure_thread.camera = self
-            self.exposure_thread.start()
-        
-
-class Window(Handler):
-    
-    def setattr(self, info, object, name ,value):
-        Handler.setattr(self, info, object, name, value)
-        info.object._updated = True
-
-        
-    def object__updated_changed(self, info):
-        if info.initialized:
-            info.ui.title += "*"
 
 
 
-def gui_connection(connection, name, status_function):
-    ''' For either the 'ifu' or 'rc' setup a gui connection. The status function
-    returns a dictionary of elements to put into the header'''
-    camera = Camera()
-    camera.name = name
-    camera.connection = connection
-    
-    camera.status_function = status_function
-    
-    if name == 'rc': camera.readout = 2
-    
-    cam_view = View(    
-            Item(name="state"),
-            Item(name="object"),
-            #Item(name="gain"),
-            #Item(name="amplifier"),
-            Item(name="readout"),
-            Item(name="shutter"),
-            Item(name="exposure"),
-            Item(name="int_time"),
-            Item(name="num_exposures"),
-            Item(name="filename"),
-            Item(name="go_button"),
-            title=name, width=350, kind='live')
+if __name__ == '__main__':
+    c = Camera()
+    c.make_connection()
 
-    
-    return camera, cam_view
+
     

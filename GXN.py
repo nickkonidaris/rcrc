@@ -9,11 +9,7 @@ Released under GPLv2
 from threading import Thread
 import telnetlib
 from traits.api import *
-from threading import Thread
-import telnetlib
-import re
 import time
-import numpy as np
 import logging as log
 
 import astropy
@@ -69,14 +65,17 @@ class Commands:
             raise TCSConnectionError(e)
             
         log.info("Connection to %s made" % PELE)
-        
+    
+    def close(self):
+        log.info("Closing telnet")
+        self.T.close()
         
     def __del__(self):
-        self.T.close()
+        self.close()
         
     def write(self, str):
         T = self.T
-        log.info("Sending '%s'" % str.rstrip())
+        log.debug("Sending '%s'" % str.rstrip())
         T.write(str)
         
     def read_until(self, s,timeout):
@@ -105,7 +104,7 @@ class Commands:
         
         log.info("GXN Slow command returned %i" % res)
         if res == 0:
-            log.info("GXN Executed command")
+            log.debug("GXN Executed command")
         else:
             log.error("GXN Command failed: %s" % self.gxn_res[res])
             raise SlowCommandFailed("%i: %s" % (res, self.gxn_res[res]))
@@ -145,8 +144,15 @@ class Commands:
     def lamps_on(self):
         log.info("GXN lamp on")
         self.write("lampon\n")
+        time.sleep(1)
         self.slow(30)
+ 
     
+    def stop(self):
+        log.info("GXN stop")
+        self.write("stop\n")
+        self.read_until("\n", .1)
+           
     def lamps_off(self):
         log.info("GXN lamp off")
         self.write("lampoff\n")
@@ -156,6 +162,18 @@ class Commands:
         log.info("GXN open dome")
         self.write("open\n")
         self.slow(300)
+    
+    def close_dome(self):
+        log.info("GXN close dome")
+        self.write("close\n")
+        self.slow(300)
+    
+    def gofocus(self, pos_mm):
+        log.info("GXN Set focus stage to %2.3f" % (pos_mm))
+        
+        self.write("gofocus %3.6f\n" % pos_mm)
+        self.slow(30)
+        
         
     def coords(self, ra, # in decimal hours
                     dec, # in decimal degrees
@@ -343,7 +361,7 @@ class GenericCommsThread(Thread):
                     type_fun = type(getattr(R, lhs))
                     setattr(R, lhs, type_fun(rhs))
                 except:
-                    log.info("Could not handle line:\n%s" % r.rstrip())
+                    log.info("Ignored malformed line:'%s'" % r.rstrip())
                     
                 
             time.sleep(2)
