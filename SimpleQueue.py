@@ -26,7 +26,6 @@ def select_next_target(lst):
     
     h,m,s = map(float, lst.split(":"))
     lstf = h*15 + m*15/60. + s*15/3600.
-    print lstf
     
     try:
         to_observe=Table.read("S:/to_observe.txt", format="ascii.fixed_width_two_line")
@@ -39,14 +38,14 @@ def select_next_target(lst):
     
     for i in xrange(len(to_observe)):
         try:
-            RA = Angle(to_observe['ra'][i]).deg
+            RA = Angle(to_observe['ra'][i])
         except astropy.units.UnitsError:
-            # Assume that the default value is degrees
+            # Assume that the default value is decimal degrees
             RA = float(to_observe['ra'][i])
 
         D = abs_diff(RA, lstf)
 
-        if np.abs(D) < 40:
+        if np.abs(D) < 60:
             oks.append(i)
     
     if len(oks) == 0: return no_target

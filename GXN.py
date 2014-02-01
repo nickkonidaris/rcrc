@@ -183,8 +183,10 @@ class Commands:
                     epoch=None): # for non sidereal
         
         
-        aRa = Angle(ra)
-        aDec = Angle(dec)
+        try: aRa = Angle(ra)
+        except: aRa = Angle("%f d" % ra)
+        try: aDec = Angle(dec)
+        except: aDec = Angle("%f d" % dec)
         
         hRA  = aRa.hour
         dDec = aDec.deg

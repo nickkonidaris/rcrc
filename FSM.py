@@ -40,7 +40,7 @@ target_plan = []
 last_focus = [datetime.now() , 14.38]
 stop_loop = False
 
-force_focus = False
+force_focus = True
 
 
 # create logger
@@ -142,8 +142,8 @@ def is_sun_ok(status):
     
     s = status['Status']['Sunlight_Status'] == 'OKAY'
     
-    if s: log.info("Sunlight status is OK")
-    else: log.info("Sunlight status is OK")
+    if s: log.debug("Sunlight status is OK")
+    else: log.debug("Sunlight status is OK")
     
     # Double check
     s2 = not status['Status']['Sun_Is_Up']
@@ -184,10 +184,10 @@ def is_telescope_initialized(status):
     
     s = status['Status']['Telescope_Ready_Status']
     if s == 'NOT_READY':
-        log.info("Telescope is not initialized")
+        log.debug("Telescope is not initialized")
         return False
     else:
-        log.info("Telescope is initialized")
+        log.debug("Telescope is initialized")
         return True
         
 def is_telescope_in_instrument_mode(status):
@@ -196,10 +196,10 @@ def is_telescope_in_instrument_mode(status):
     s = status['Status']['Telescope_Control_Status']
     
     if s == 'REMOTE':
-        log.info("Telescope is available")
+        log.debug("Telescope is available")
         return True
     else:
-        log.info("Telescope in manual mode")
+        log.debug("Telescope in manual mode")
         return False
     
     
@@ -209,7 +209,7 @@ def is_telescope_powered(status):
     s = status['Status']
     if  (s['Oil_Pad_Status'] == 'READY') and \
         (s['Telescope_Power_Status'] == 'READY'):
-            log.info("Telescope is powered")
+            log.debug("Telescope is powered")
             return True
     else:
         log.info("Telescope is not powered")
@@ -270,6 +270,7 @@ class DomeOpenState(object):
             return "weather_safe"
         
         if not is_sun_ok(inputs):
+            log.info ("[%s] sun is not ok" % self.__class__.__name__)
             return "close"
         
         log.info("[%s].execute()" % self.__class__.__name__)            
@@ -300,6 +301,7 @@ class startup(State):
     
         new_state = check_basics(inputs)
 
+        
         if new_state != '':
             return new_state
         
@@ -494,6 +496,38 @@ class open_dome(State):
                 return "open_dome_failed"
         
         return "observe"
+        
+        
+class open_dome_failed(State):
+    '''Deals with failure to open dome.
+    Untested as of 31 Jan 2014'''
+    def __init__(self):
+        State.__init__(self)
+        
+    def execute(self, prev_state_name, inputs):
+        State.execute(self, prev_state_name, inputs)
+        
+        if not is_weather_safe(inputs):
+            return "weather_safe"
+        
+        if not is_sun_ok(inputs):
+            return "waitfor_sunset"
+        
+        if prev_state_name != 'open_dome_failed':
+            log.error("Dome open failure. Will try again")
+            # Email everyone
+
+        
+        if not is_dome_open(inputs):
+            try: 
+                cmd = GXN.Commands()
+                cmd.open_dome()
+                cmd.close()
+            except:
+                cmd.close()
+                return "open_dome_failed"
+        
+        return "observe"
 
 class weather_safe(State):
     def __init__(self):
@@ -514,7 +548,7 @@ class weather_safe(State):
                 cmd.close()
                 
         if not is_weather_safe(inputs):
-            time.sleep(10)
+            time.sleep(30)
             return "weather_safe"
         
         return "observe"
@@ -549,10 +583,14 @@ class select_target(DomeOpenState):
         
         global next_target, target_plan
         
+
         lst = inputs['Telescope']['LST']
         log.debug("SimpleQueue.select_next_target at %s" % lst)
         next_target = SimpleQueue.select_next_target(lst)
         
+        log.info("Next Target: %s" % next_target)
+
+    
         if next_target[0] is None:
             log.debug("No target found")
             time.sleep(20)
@@ -564,7 +602,7 @@ class select_target(DomeOpenState):
                     "i": next_target['i']}
         target_plan = ExposureSet.create_target_plan(times)
         log.info("Created new plan: %s" % target_plan)
-    
+        
         return "slew_to_target"
 
 class slew_to_target(DomeOpenState):
@@ -572,21 +610,25 @@ class slew_to_target(DomeOpenState):
         DomeOpenState.__init__(self)
         
     def execute(self, prev_state_name, inputs):
+    
+
         ns=DomeOpenState.execute(self, prev_state_name, inputs)
         if ns != '': return ns
-        global next_target, last_focus
+        global next_target, last_focus, force_focus
         
-        
+
         try:
             cmd = GXN.Commands()
-            cmd.coords( next_target[1], 
-                        next_target[2],
-                        next_target[3],
+            cmd.coords( next_target['ra'], 
+                        next_target['dec'],
+                        next_target['epoch'],
                         0, 0, 0)
             cmd.go()
             cmd.close()
-        except:
+        except Exception as e:
+            log.error("Failed to slew: %s" % e)
             cmd.close()
+            time.sleep(1)
             return "slew_failed"
                 
         time_since_last_focus = datetime.now() - last_focus[0]
@@ -600,6 +642,8 @@ class slew_to_target(DomeOpenState):
             return "secfocus_loop"
         
         return "exposure_handler"
+        
+
 
 class exposure_handler(DomeOpenState):
     def __init__(self):
@@ -638,7 +682,7 @@ class expose_target(DomeOpenState):
         
         rc_camera.shutter = "normal"
         try:
-            expose(itime)
+            expose(itime[0])
         except gui.ExposureCommsProblem:
             return "detector_problem"
             
@@ -683,7 +727,7 @@ class secfocus_loop(DomeOpenState):
         try:
             cmd = GXN.Commands()
             
-            positions = numpy.arange(14.1, 14.4, 0.025)
+            positions = numpy.arange(14.0, 14.8, 0.1)
             filenames = []
             
             rc_camera.object = "Focus Loop"        
@@ -725,7 +769,10 @@ class telescope_not_powered(State):
             log.error("Telescope is not powered. Emailing people")
         
         time.sleep(20)
-        return check_basics(inputs)
+        ns = check_basics(inputs)
+        if ns == "":
+            return "startup"
+        return ns
 
 class telescope_not_in_instrument_mode(State):
     def __init__(self):
@@ -739,7 +786,10 @@ class telescope_not_in_instrument_mode(State):
             log.error("Telescope is not in instrument mode. Emailing people")
         
         time.sleep(20)
-        return check_basics(inputs)
+        ns = check_basics(inputs)
+        if ns == "":
+            return "startup"
+        return ns
 
 class StateMachine:
     # statetable is initialized dynamically by programatically
@@ -761,7 +811,7 @@ class StateMachine:
         log.info("All states initialized.")
         
         self.prev_state_name = None
-        self.next_state_name = "startup"
+        self.next_state_name = "configure_flats"
     
     def execute(self, inputs):
         
@@ -808,7 +858,7 @@ def start_software():
 
     rc_camera = gui.Camera()
     rc_camera.status_function = get_input
-    rc_camera.xpa_class = 'c6ca7de8:1962'
+    rc_camera.xpa_class = 'c6ca7de8:18639'
     rc_camera.readout=2.0
         
     rc_camera.make_connection()
@@ -827,7 +877,9 @@ def main():
 
 def fsm_loop():
     global Status, rc_pid, theSM, stop_loop
-    #GXNCmd.takecontrol()
+    cmd = GXN.Commands()
+    cmd.takecontrol()
+    cmd.close()
     while stop_loop == False:
         try:
             inputs = get_input()
@@ -847,4 +899,4 @@ def fsm_loop():
 if __name__ == '__main__':
     main()
     #fsm_loop()
-    Thread(target=fsm_loop).start()
+    #Thread(target=fsm_loop).start()

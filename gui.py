@@ -98,9 +98,7 @@ class Camera(HasTraits):
         label='gain')
     
     num_exposures = Int(1)
-    
-    int_time = Int(0)
-    
+        
     readout = Enum([0.1, 2.0],
         desc="Readout speed in MHz",
         label="readout")
